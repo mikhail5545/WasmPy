@@ -1,5 +1,7 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
-#[cfg(test)]
+
+pub use crate::parser::Parser;
+
 mod tests;
