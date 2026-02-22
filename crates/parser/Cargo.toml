@@ -1,0 +1,8 @@
+[package]
+name="parser"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+logos.workspace = true
