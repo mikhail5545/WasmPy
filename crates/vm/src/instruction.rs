@@ -50,6 +50,7 @@ pub enum Value{
     Float(f64),
     Str(String),
     Bool(bool),
+    Function(usize), // Index into function table
     None,
 }
 
