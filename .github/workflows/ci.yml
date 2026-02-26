@@ -1,0 +1,71 @@
+name: ci.yml
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '**/doc/**'
+      - '**/docs/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '**/doc/**'
+      - '**/docs/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and Test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - wasm32-wasip1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check formatting
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build Workspace
+        run: cargo build --workspace --target ${{ matrix.target }}
+
+      - name: Run Tests (Native)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: Install Wasmtime (for WASI tests)
+        if: matrix.target == 'wasm32-wasip1'
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH 
+        
+      - name: Run Tests (WASI)
+        if: matrix.target == 'wasm32-wasip1'
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir .
+        run: cargo test --workspace --target ${{ matrix.target }}
