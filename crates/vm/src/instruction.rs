@@ -14,14 +14,19 @@
  * limitations under the License.
  */
 
+use crate::error::RuntimeError;
+
 #[derive(Debug, Clone)]
 pub enum Instruction{
     /// Load a constant into a register: reg = value
     LoadConst(u8, Value),
     /// Load a variable into a register: reg = var_name
-    LoadName(u8, String),
+    LoadGlobal(u8, String),
+    LoadLocal(u8, String), // for function scopes: reg = var_name
     /// Store a register's value into a variable: var_name = reg
-    StoreName(String, u8),
+    StoreGlobal(String, u8),
+    /// Store a register's value into a local variable (for function scopes): var_name = reg
+    StoreLocal(String, u8),
     /// reg_dest = reg_left OP reg_right
     BinOp(u8, BinOpKind, u8, u8),
     /// reg_dest = OP reg_src (unary)
@@ -36,21 +41,47 @@ pub enum Instruction{
     Call(u8, u8, u8, u8),
     /// Return value in register
     Return(u8),
-    /// Print register value (for debugging or print() builtin)
-    Print(u8),
     /// Move reg_dst = reg_src (used for variable assignment or copying values)
     Move(u8, u8),
+    /// Build a tuple from consecutive registers `[reg_start..reg_start+count]`, store in reg_dest -> reg_dest, reg_start, count
+    BuildTuple(u8, u8, u8),
+    /// Build a list from consecutive registers `[reg_start..reg_start+count]`, store in reg_dest -> reg_dest, reg_start, count
+    BuildList(u8, u8, u8),
+    /// Load an attribute 'name' from an object in reg_obj, store in reg_dest -> reg_dest, reg_obj, attr_name
+    LoadAttr(u8, u8, String),
     /// Halt the VM execution
     Halt,
 }
 
-#[derive(Debug, Clone)]
+pub struct NativeFn{
+    pub func: Box<dyn Fn(&[Value]) -> Result<Value, RuntimeError>>,
+}
+
+impl std::fmt::Debug for NativeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeFn")
+            .finish()
+    }
+}
+
+impl PartialEq for NativeFn {
+    fn eq(&self, _other: &Self) -> bool {
+        // Native functions are not comparable, so we return false
+        false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value{
     Int(i64),
     Float(f64),
     Str(String),
     Bool(bool),
+    Tuple(Vec<Value>),
+    List(std::rc::Rc<std::cell::RefCell<Vec<Value>>>),
     Function(usize), // Index into function table
+    /// Unified representation for both built-in global functions (print) and attribute functions (obj.method)
+    NativeFunc(std::rc::Rc<NativeFn>),
     None,
 }
 

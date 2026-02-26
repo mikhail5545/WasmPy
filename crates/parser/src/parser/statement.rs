@@ -170,7 +170,36 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
                 target: expr,
                 op: aug_op,
                 value,
+                type_hint: None,
             });
+        }
+
+        // Check for type annotation: `expr: type` or `expr: type = value`
+        if self.peek_token() == Token::Colon {
+            self.advance(); // consume `:`
+            let type_hint_spanned = self.parse_type_hint()?;
+
+            if self.eat(Token::Assign) {
+                // Annotated assignment: `x: int = 5`
+                let value = self.parse_expr()?;
+                self.eat(Token::Newline);
+                return Ok(Stmt::Assign {
+                    targets: vec![expr],
+                    value,
+                    type_hint: Some(type_hint_spanned),
+                });
+            } else {
+                // Annotation-only statement: `x: int`
+                // Produce an Assign with NoneLit as the value placeholder
+                let none_span = self.current_span.clone();
+                let value = Spanned::new(Expr::NoneLit, none_span);
+                self.eat(Token::Newline);
+                return Ok(Stmt::Assign {
+                    targets: vec![expr],
+                    value,
+                    type_hint: Some(type_hint_spanned),
+                });
+            }
         }
 
         // Check for plain assignment: `expr = value`
@@ -187,6 +216,7 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
             return Ok(Stmt::Assign {
                 targets,
                 value: final_value,
+                type_hint: None,
             });
         }
 
@@ -282,10 +312,12 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;
         self.expect(Token::RParen)?;
-        let return_type = if self.eat(Token::Arrow) {
-            Some(self.parse_expr()?)
+        let (return_type, return_type_hint) = if self.eat(Token::Arrow) {
+            let rt = self.parse_expr()?;
+            let hint = Self::convert_expr_to_type_hint(&rt);
+            (Some(rt), hint)
         } else {
-            None
+            (None, None)
         };
         self.expect(Token::Colon)?;
         let body = self.parse_block()?;
@@ -293,6 +325,7 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
             name,
             params,
             return_type,
+            return_type_hint,
             body,
             decorators,
         })
@@ -305,10 +338,12 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
         }
         loop {
             let name = self.expect_name()?;
-            let annotation = if self.eat(Token::Colon) {
-                Some(self.parse_expr()?)
+            let (annotation, type_hint) = if self.eat(Token::Colon) {
+                let ann = self.parse_expr()?;
+                let hint = Self::convert_expr_to_type_hint(&ann);
+                (Some(ann), hint)
             } else {
-                None
+                (None, None)
             };
             let default = if self.eat(Token::Assign) {
                 Some(self.parse_expr()?)
@@ -319,6 +354,7 @@ impl<I: Iterator<Item = SpannedToken>> Parser<I> {
                 name,
                 annotation,
                 default,
+                type_hint,
             });
             if !self.eat(Token::Comma) {
                 break;

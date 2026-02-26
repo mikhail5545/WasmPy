@@ -13,13 +13,4 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-mod vm;
-pub mod instruction;
-pub mod compiler;
-pub mod builtin;
-pub mod error;
-
-#[cfg(test)]
-mod tests;
-
+pub mod builtin_test;

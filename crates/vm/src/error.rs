@@ -14,12 +14,9 @@
  * limitations under the License.
  */
 
-mod vm;
-pub mod instruction;
-pub mod compiler;
-pub mod builtin;
-pub mod error;
-
-#[cfg(test)]
-mod tests;
-
+#[derive(Debug, Clone)]
+pub enum RuntimeError{
+    TypeError(String),
+    ValueError(String),
+    OutOfBounds(String),
+}

@@ -1,4 +1,8 @@
-use crate::ast::{BinOp, Expr, Module, Stmt};
+use ast::Module;
+use ast::stmt::Stmt;
+use ast::expr::Expr;
+use ast::op::BinOp;
+use ast::types::TypeHint;
 use crate::lexer::IndentLexer;
 use crate::parser::Parser;
 
@@ -14,7 +18,7 @@ fn test_simple_assignment() {
     let m = parse("x = 42\n");
     assert_eq!(m.body.len(), 1);
     match &m.body[0].node {
-        Stmt::Assign { targets, value } => {
+        Stmt::Assign { targets, value, .. } => {
             assert_eq!(targets.len(), 1);
             match &targets[0].node {
                 Expr::Name(n) => assert_eq!(n, "x"),
@@ -231,3 +235,212 @@ fn test_from_import() {
         other => panic!("expected FromImport, got {:?}", other),
     }
 }
+
+#[test]
+fn test_annotated_assignment_int() {
+    let m = parse("x: int = 42\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { targets, value, type_hint } => {
+            assert_eq!(targets.len(), 1);
+            match &targets[0].node {
+                Expr::Name(n) => assert_eq!(n, "x"),
+                other => panic!("expected Name, got {:?}", other),
+            }
+            match &value.node {
+                Expr::Number(n) => assert_eq!(n, "42"),
+                other => panic!("expected Number, got {:?}", other),
+            }
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Int);
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_str() {
+    let m = parse("name: str = \"hello\"\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Str);
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_list() {
+    let m = parse("items: List[int] = []\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::List(Box::new(TypeHint::Int)));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_dict() {
+    let m = parse("data: Dict[str, int] = {}\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Dict(Box::new(TypeHint::Str), Box::new(TypeHint::Int)));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_optional() {
+    let m = parse("val: Optional[int] = 5\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Optional(Box::new(TypeHint::Int)));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotation_only_statement() {
+    let m = parse("x: int\n");
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Int);
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_plain_assignment_no_type_hint() {
+    let m = parse("x = 42\n");
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            assert!(type_hint.is_none(), "plain assignment should have no type hint");
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_func_def_with_param_type_hints() {
+    let src = "\
+def add(x: int, y: int) -> int:
+    return x + y
+";
+    let m = parse(src);
+    assert_eq!(m.body.len(), 1);
+    match &m.body[0].node {
+        Stmt::FuncDef { name, params, return_type_hint, .. } => {
+            assert_eq!(name, "add");
+            assert_eq!(params.len(), 2);
+            let x_hint = params[0].type_hint.as_ref().expect("expected type hint for x");
+            assert_eq!(x_hint.node, TypeHint::Int);
+            let y_hint = params[1].type_hint.as_ref().expect("expected type hint for y");
+            assert_eq!(y_hint.node, TypeHint::Int);
+            let ret_hint = return_type_hint.as_ref().expect("expected return type hint");
+            assert_eq!(ret_hint.node, TypeHint::Int);
+        }
+        other => panic!("expected FuncDef, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_func_def_no_type_hints() {
+    let src = "\
+def foo(x, y):
+    pass
+";
+    let m = parse(src);
+    match &m.body[0].node {
+        Stmt::FuncDef { params, return_type_hint, .. } => {
+            assert!(params[0].type_hint.is_none());
+            assert!(params[1].type_hint.is_none());
+            assert!(return_type_hint.is_none());
+        }
+        other => panic!("expected FuncDef, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_func_def_with_complex_return_type() {
+    let src = "\
+def get_items() -> List[str]:
+    pass
+";
+    let m = parse(src);
+    match &m.body[0].node {
+        Stmt::FuncDef { return_type_hint, .. } => {
+            let hint = return_type_hint.as_ref().expect("expected return type hint");
+            assert_eq!(hint.node, TypeHint::List(Box::new(TypeHint::Str)));
+        }
+        other => panic!("expected FuncDef, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_custom_type() {
+    let m = parse("obj: MyClass = create()\n");
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Custom("MyClass".to_string()));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_tuple_type() {
+    let m = parse("pair: Tuple[int, str] = (1, \"a\")\n");
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Tuple(vec![TypeHint::Int, TypeHint::Str]));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_annotated_assignment_set_type() {
+    let m = parse("s: Set[int] = {1, 2}\n");
+    match &m.body[0].node {
+        Stmt::Assign { type_hint, .. } => {
+            let hint = type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Set(Box::new(TypeHint::Int)));
+        }
+        other => panic!("expected Assign, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_func_param_with_default_and_type_hint() {
+    let src = "\
+def greet(name: str = \"world\"):
+    pass
+";
+    let m = parse(src);
+    match &m.body[0].node {
+        Stmt::FuncDef { params, .. } => {
+            assert_eq!(params.len(), 1);
+            let hint = params[0].type_hint.as_ref().expect("expected type hint");
+            assert_eq!(hint.node, TypeHint::Str);
+            assert!(params[0].default.is_some(), "expected default value");
+        }
+        other => panic!("expected FuncDef, got {:?}", other),
+    }
+}
+

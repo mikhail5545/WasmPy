@@ -1,10 +1,8 @@
 [package]
-name="vm"
+name = "ast"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-parser = { path = "../parser" }
-ast = { path = "../ast" }
-anyhow.workspace = true
+logos.workspace = true

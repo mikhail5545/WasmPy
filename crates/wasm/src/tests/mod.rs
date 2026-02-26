@@ -14,12 +14,8 @@
  * limitations under the License.
  */
 
-mod vm;
-pub mod instruction;
-pub mod compiler;
-pub mod builtin;
-pub mod error;
-
 #[cfg(test)]
-mod tests;
+mod type_checker_tests;
+#[cfg(test)]
+mod compiler_tests;
 

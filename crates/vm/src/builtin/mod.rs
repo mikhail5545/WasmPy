@@ -13,13 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+pub mod string;
+pub mod globals;
 
-mod vm;
-pub mod instruction;
-pub mod compiler;
-pub mod builtin;
-pub mod error;
+use crate::instruction::Value;
 
-#[cfg(test)]
-mod tests;
-
+pub fn get_attribute(target: &Value, attr_name: &str) -> Option<Value> {
+    match target {
+        Value::Str(s) => string::get_string_attribute(s, attr_name),
+        _ => None,
+    }
+}

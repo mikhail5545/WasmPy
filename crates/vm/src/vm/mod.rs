@@ -1,3 +1,21 @@
+/*
+ * Copyright (c) 2026. Mikhail Kulik.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+mod instruction_handlers;
+
 use std::collections::HashMap;
 use crate::instruction::*;
 
@@ -11,6 +29,9 @@ struct CallFrame{
     /// Where to store the return value in the CALLER's register file.
     /// This is None for the top-level frame, and Some(reg) for function calls, indicating which register in the caller's frame should receive the return value when this frame returns.
     pub return_reg: Option<u8>,
+    /// A mapping of local variable names to their values, used for variable storage and lookup within the function.
+    /// This allows for named variables in addition to register-based storage.
+    pub locals: HashMap<String, Value>,
 }
 
 impl CallFrame {
@@ -20,6 +41,7 @@ impl CallFrame {
             pc: 0,
             registers: Box::new(std::array::from_fn(|_| Value::None)),
             return_reg,
+            locals: HashMap::new(),
         }
     }
 }
@@ -37,12 +59,27 @@ pub struct RegisterVM{
 }
 
 impl RegisterVM{
-    pub fn new(instructions: Vec<Instruction>) -> Self{
+    pub fn new() -> Self{
+        let mut globals = HashMap::new();
+
+        crate::builtin::globals::register_globals(&mut globals);
+
         Self{
-            globals: HashMap::new(),
+            globals,
             call_stack: Vec::new(),
             functions: HashMap::new(),
         }
+    }
+
+    pub fn load(&mut self, result: crate::compiler::CompilationResult) {
+        for (i, func_code) in result.functions.into_iter().enumerate() {
+            self.functions.insert(i, func_code.instructions);
+        }
+
+        let main_frame = CallFrame::new(result.main.instructions, None);
+
+        self.call_stack.clear();
+        self.call_stack.push(main_frame);
     }
 
     pub fn run(&mut self) {
@@ -66,105 +103,53 @@ impl RegisterVM{
             let instruction = frame.instructions[frame.pc].clone();
             frame.pc += 1; // Increment program counter before executing instruction
 
-            if let Some(should_halt) = self.match_instruction(instruction) {
-                if should_halt {
-                    break; // Halt the VM execution
-                }
+            if self.match_instruction(instruction) {
+                break; // If the instruction signals to halt the VM, break the loop
             }
         }
     }
 
-    fn match_instruction(&mut self, instruction: Instruction) -> Option<bool> {
+    fn get_attribute(target: &Value, name: &str) -> Option<Value> {
+        crate::builtin::get_attribute(target, name)
+    }
+
+    fn handle_runtime_error(&mut self, error: crate::error::RuntimeError) -> bool{
+        println!("Runtime error: {:?}", error);
+
+
+        // TODO: In the future, loop through self.call_stack here.
+        // If a "try/catch" block is found (stored in CallFrame metadata),
+        // move pc to the 'catch' block and push the error to a register.
+
+        println!("Traceback (most recent call last):");
+        for frame in &self.call_stack {
+            println!("  at instruction index {} in function with instructions: {:?}", frame.pc, frame.instructions);
+        }
+        println!("{:?}", error);
+        true // Halt the VM after an unhandled runtime error
+    }
+
+    /// Dispatches the given instruction to the appropriate handler method based on its type.
+    /// Each instruction variant is matched and the corresponding operation is executed.
+    fn match_instruction(&mut self, instruction: Instruction) -> bool {
         match instruction {
-            Instruction::LoadConst(register, value) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                frame.registers[register as usize] = value.clone();
-                Some(false)
-            }
-            Instruction::LoadName(register, name) => {
-                let value = self.globals.get(&name).cloned().unwrap_or(Value::None);
-                self.call_stack.last_mut().unwrap().registers[register as usize] = value;
-                Some(false)
-            }
-            Instruction::StoreName(name, register) => {
-                let value = self.call_stack.last_mut().unwrap().registers[register as usize].clone();
-                self.globals.insert(name.clone(), value);
-                Some(false)
-            }
-            Instruction::BinOp(dest, op, left, right) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                let result = Self::eval_binop(op, &frame.registers[left as usize], &frame.registers[right as usize]);
-                frame.registers[dest as usize] = result;
-                Some(false)
-            }
-            Instruction::UnaryOp(dest, op, src) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                let result = Self::eval_unary_op(op, &frame.registers[src as usize]);
-                frame.registers[dest as usize] = result;
-                Some(false)
-            }
-            Instruction::Compare(dest, op, left, right) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                let result = Self::eval_compare(op, &frame.registers[left as usize], &frame.registers[right as usize]);
-                frame.registers[dest as usize] = result;
-                Some(false)
-            }
-            Instruction::JumpIfFalse(cond_reg, target) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                let cond_value = &frame.registers[cond_reg as usize];
-                if !Self::is_truthy(cond_value) {
-                    frame.pc = target; // Jump to target instruction index
-                }
-                Some(false)
-            }
-            Instruction::Jump(target) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                frame.pc = target; // Unconditional jump to target instruction index
-                Some(false)
-            }
-            Instruction::Move(dest_reg, src_reg) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                frame.registers[dest_reg as usize] = frame.registers[src_reg as usize].clone();
-                Some(false)
-            }
-            Instruction::Print(reg) => {
-                let frame = self.call_stack.last_mut().unwrap();
-                let value = &frame.registers[reg as usize];
-                println!("{}", Self::display_value(value));
-                Some(false)
-            }
-            Instruction::Call(dest_reg, func_reg, arg_start, arg_count) => {
-                let caller = self.call_stack.last().unwrap();
-                let func_value = caller.registers[func_reg as usize].clone();
-
-                if let Value::Function(func_id) = func_value {
-                    let func_instructions = self.functions.get(&func_id).expect("Function ID not found in function table").clone();
-
-                    // Copy arguments from caller into new frame
-                    let mut new_frame = CallFrame::new(func_instructions, Some(dest_reg));
-                    for i in 0..arg_count{
-                        new_frame.registers[i as usize] = caller.registers[(arg_start + i) as usize].clone();
-                    }
-                    self.call_stack.push(new_frame);
-                } else {
-                    panic!("Attempted to call a non-function value: {:?}", func_value);
-                }
-                Some(false)
-            }
-            Instruction::Return(reg) => {
-                let return_value = self.call_stack.last().unwrap().registers[reg as usize].clone();
-                let return_reg = self.call_stack.last().unwrap().return_reg;
-                self.call_stack.pop();
-
-                match(return_reg, self.call_stack.last_mut()) {
-                    (Some(dest), Some(caller)) => {
-                        caller.registers[dest as usize] = return_value;
-                        Some(false)
-                    }
-                    _ => Some(true), // Returning from top-level frame or no caller, halt the VM
-                }
-            }
-            Instruction::Halt => Some(true), // Explicit halt instruction, stop the VM
+            Instruction::LoadConst(register, value) => self.op_load_const(register, value),
+            Instruction::LoadGlobal(register, name) => self.op_load_global(register, name),
+            Instruction::LoadLocal(register, name) => self.op_load_local(register, name),
+            Instruction::StoreGlobal(name, register) => self.op_store_global(name, register),
+            Instruction::StoreLocal(name, register) => self.op_store_local(name, register),
+            Instruction::BinOp(dest, op, left, right) => self.op_bin_op(dest, op, left, right),
+            Instruction::UnaryOp(dest, op, src) => self.op_unary_op(dest, op, src),
+            Instruction::Compare(dest, op, left, right) => self.op_cmp_op(dest, op, left, right),
+            Instruction::JumpIfFalse(cond_reg, target) => self.op_jump_if_false(cond_reg, target),
+            Instruction::Jump(target) => self.op_jump(target),
+            Instruction::Move(dest_reg, src_reg) => self.op_move(dest_reg, src_reg),
+            Instruction::BuildList(dest_reg, start_reg, count) => self.op_build_list(dest_reg, start_reg, count),
+            Instruction::BuildTuple(dest_reg, start_reg, count) => self.op_build_tuple(dest_reg, start_reg, count),
+            Instruction::Call(dest_reg, func_reg, arg_start, arg_count) => self.op_call(dest_reg, func_reg, arg_start, arg_count),
+            Instruction::Return(reg) => self.op_return(reg),
+            Instruction::Halt => true, // Explicit halt instruction, stop the VM
+            _ => false,
         }
     }
 
@@ -259,7 +244,9 @@ impl RegisterVM{
             Value::Str(s) => !s.is_empty(),
             Value::Bool(b) => *b,
             Value::Function(_) => true, // Functions are always truthy
+            Value::NativeFunc(_) => true,
             Value::None => false,
+            _ => false,
         }
     }
 
@@ -271,7 +258,9 @@ impl RegisterVM{
             Value::Str(s) => s.clone(),
             Value::Bool(b) => (if *b { "True" } else { "False" }).to_string(),
             Value::Function(id) => format!("<function {}>", id),
+            Value::NativeFunc(func) => format!("<native function {:p}>", func),
             Value::None => "None".to_string(),
+            _ => "<unknown value>".to_string(),
         }
     }
 

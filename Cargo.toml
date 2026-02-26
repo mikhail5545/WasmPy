@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members=[
-    "crates/parser", "crates/vm",
+members=["crates/ast",
+    "crates/parser", "crates/vm", "crates/wasm",
 ]
 
 [workspace.package]
@@ -13,3 +13,8 @@ version="0.1.0"
 [workspace.dependencies]
 anyhow = "1.0"
 logos="0.16.1"
+clap="4.5.60"
+parser = { path = "crates/parser" }
+ast = { path = "crates/ast" }
+wasm = { path = "crates/wasm" }
+vm = { path = "crates/vm" }

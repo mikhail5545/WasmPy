@@ -3,11 +3,15 @@ mod binop;
 mod helpers;
 mod statement;
 mod postfix;
+mod type_hint;
 
 use logos::Span;
 use std::iter::Peekable;
 
-use crate::ast::*;
+use ast::{Module, Param, Spanned, ExceptHandler};
+use ast::expr::*;
+use ast::stmt::*;
+use ast::op::*;
 use crate::lexer::{SpannedToken, Token};
 
 #[derive(Debug, Clone)]

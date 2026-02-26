@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
-mod vm;
-pub mod instruction;
-pub mod compiler;
-pub mod builtin;
-pub mod error;
-
-#[cfg(test)]
-mod tests;
-
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeHint{
+    None,
+    Int,
+    Float,
+    Str,
+    Bool,
+    List(Box<TypeHint>),
+    Tuple(Vec<TypeHint>),
+    Dict(Box<TypeHint>, Box<TypeHint>),
+    Set(Box<TypeHint>),
+    Optional(Box<TypeHint>),
+    Custom(String), // For user-defined types
+}

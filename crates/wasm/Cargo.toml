@@ -1,5 +1,5 @@
 [package]
-name="vm"
+name = "wasm"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -7,4 +7,9 @@ version.workspace = true
 [dependencies]
 parser = { path = "../parser" }
 ast = { path = "../ast" }
-anyhow.workspace = true
+wasm-encoder = "0.245.1"
+thiserror = "2"
+logos.workspace = true
+
+[dev-dependencies]
+wasmparser = "0.245.1"

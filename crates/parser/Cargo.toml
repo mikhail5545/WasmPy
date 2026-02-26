@@ -6,3 +6,4 @@ version.workspace = true
 
 [dependencies]
 logos.workspace = true
+ast = { path = "../ast" }
