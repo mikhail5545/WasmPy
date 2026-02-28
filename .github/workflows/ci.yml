@@ -1,14 +1,14 @@
 name: ci.yml
 on:
   push:
-    branches: [main]
+    branches: ["master"]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
       - '**/doc/**'
       - '**/docs/**'
   pull_request:
-    branches: [main]
+    branches: ["master"]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
