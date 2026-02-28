@@ -21,6 +21,11 @@
 //! type annotations are present and correct.
 
 pub mod op;
+pub mod op_dispatch;
+pub mod helpers;
+mod control_flow;
+pub mod literal;
+pub mod data_access;
 
 use ast::expr::Expr;
 use ast::op::*;
@@ -30,7 +35,9 @@ use ast::{Module, Param, Spanned};
 use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ExportKind, ExportSection, FunctionSection,
-    Instruction, Module as WasmModule, TypeSection, ValType,
+    Instruction, Module as WasmModule, TypeSection, ValType, MemorySection,
+    MemoryType, GlobalSection, GlobalType, ConstExpr, ArrayType, StructType,
+    FieldType, StorageType, RefType, HeapType, DataSection,
 };
 
 use crate::functions::FunctionContext;
@@ -60,26 +67,66 @@ struct FuncMeta {
 /// - Python `int` → i64, `float` → f64, `bool` → i32.
 pub struct Compiler {
     type_section: TypeSection,
+    /// Function section of a module defines a list of function signatures (type indices) that correspond 1:1 with the code section's function bodies. They have their own local section
+    /// https://webassembly.github.io/spec/core/syntax/modules.html#function-section
+    ///
+    /// Note: the function section only lists type indices, while the actual function bodies (with their own local declarations) are defined in the code section.
+    /// This separation allows for more flexible function definitions and better code organization.
     function_section: FunctionSection,
+    /// Export section of a module defines a set of exports that become accessible to the host environment when the module is instantiated.
+    /// https://webassembly.github.io/spec/core/syntax/modules.html#exports
     export_section: ExportSection,
+    /// Code section decodes the list of code entries that are pairs of lists of locals and expressions. They represent the bodies of functions defined by a module.
+    /// https://webassembly.github.io/spec/core/syntax/modules.html#code-section
     code_section: CodeSection,
-
+    data_section: DataSection,
     /// Function name → metadata (for call resolution)
     func_table: HashMap<String, FuncMeta>,
     /// Next function index in the WASM module
     next_func_index: u32,
+    /// Pre-registered type indices for common types, used for calls to initialize objects in type section (e.g. `struct.new $index`)
+    string_type_index: u32,
+    i64_array_type_index: u32,
+    ref_array_type_index: u32,
+    i64_tuple_type_index: u32,
+    next_data_index: u32,
+    current_context: Option<FunctionContext>,
 }
 
 impl Compiler {
     pub fn new() -> Self {
+        let mut type_section = TypeSection::new();
+        type_section.ty().array(&StorageType::I8, true);
+        type_section.ty().array(&StorageType::Val(ValType::I64), true);
+        type_section.ty().array(&StorageType::Val(ValType::Ref(RefType {
+            nullable: true,
+            heap_type: HeapType::ANY,
+        })), true);
+        type_section.ty().array(&StorageType::Val(ValType::I64), true);
+        let string_type_index = 0; // First type is our string struct
+        let i64_array_type_index = 1; // Second type is our i64 array
+        let ref_array_type_index = 2;
+        let i64_tuple_type_index = 3; // Third type is our i64 tuple (for future use)
+        
         Self {
-            type_section: TypeSection::new(),
+            type_section,
             function_section: FunctionSection::new(),
             export_section: ExportSection::new(),
             code_section: CodeSection::new(),
             func_table: HashMap::new(),
+            data_section: DataSection::new(),
+            string_type_index,
+            i64_array_type_index,
+            ref_array_type_index,
+            i64_tuple_type_index,
+            next_data_index: 0,
             next_func_index: 0,
+            current_context: None,
         }
+    }
+
+    fn ctx(&mut self) -> &mut FunctionContext{
+        self.current_context.as_mut().expect("No active function context")
     }
 
     /// Compile an entire module. This is the main entry point.
@@ -87,6 +134,8 @@ impl Compiler {
     /// Pass 1: Register all function signatures into the type section.
     /// Pass 2: Compile all function bodies.
     /// Pass 3: Compile top-level code into `_start`.
+    ///
+    /// `module ::= module type* import* tag* global* mem* table* func* data* elem* start? export*`
     pub fn compile_module(&mut self, module: &Module) {
         // ── Pass 1: Register function signatures ──
         for stmt in &module.body {
@@ -129,14 +178,7 @@ impl Compiler {
         wasm_module.finish()
     }
 
-    // ─── Function registration ───────────────────────────────────────────
-
-    fn register_function(
-        &mut self,
-        name: &str,
-        params: &[Param],
-        return_type_hint: &Option<Spanned<TypeHint>>,
-    ) {
+    fn register_function(&mut self, name: &str, params: &[Param], return_type_hint: &Option<Spanned<TypeHint>>) {
         let param_types: Vec<WasmType> = params
             .iter()
             .filter_map(|p| {
@@ -153,15 +195,14 @@ impl Compiler {
 
         let wasm_params: Vec<ValType> = param_types
             .iter()
-            .filter_map(|t| t.to_val_type())
+            .filter_map(|t| t.to_val_type(self.string_type_index, self.i64_array_type_index))
             .collect();
 
-        let wasm_results: Vec<ValType> = return_type.to_val_type().into_iter().collect();
+        let wasm_results: Vec<ValType> = return_type.to_val_type(self.string_type_index, self.i64_array_type_index).into_iter().collect();
 
-        let type_index = self.next_func_index; // type and func indices align 1:1
-        self.type_section
-            .ty()
-            .function(wasm_params, wasm_results);
+
+        self.type_section.ty().function(wasm_params, wasm_results);
+        let type_index = self.type_section.len() - 1; // Get the index of the type we just added, since we have custom GC types and indices are not guaranteed to be sequential
         self.function_section.function(type_index);
         self.export_section
             .export(name, ExportKind::Func, self.next_func_index);
@@ -179,8 +220,10 @@ impl Compiler {
         self.next_func_index += 1;
     }
 
-    // ─── Top-level _start ────────────────────────────────────────────────
-
+    /// Defines index of the `_start` function, which is automatically invoked when the module is instantiated after tables and memories are set up.
+    /// see [`WASM spec on start function`] for details.
+    ///
+    /// [`WASM spec on start function`]: https://webassembly.github.io/spec/core/syntax/modules.html#start-function
     fn compile_start(&mut self, module: &Module) {
         // Check if there are any top-level statements (besides FuncDef)
         let has_top_level = module.body.iter().any(|s| !matches!(s.node, Stmt::FuncDef { .. }));
@@ -196,20 +239,18 @@ impl Compiler {
             .export("_start", ExportKind::Func, self.next_func_index);
         self.next_func_index += 1;
 
-        let mut ctx = FunctionContext::new_start();
+        self.current_context = Some(FunctionContext::new_start(self.string_type_index, self.i64_array_type_index));
 
         for stmt in &module.body {
             if !matches!(stmt.node, Stmt::FuncDef { .. }) {
-                self.compile_stmt(&stmt.node, &mut ctx);
+                self.compile_stmt(&stmt.node);
             }
         }
 
-        ctx.emit_end();
-        let func = ctx.build();
+        self.ctx().emit_end();
+        let func = self.ctx().build();
         self.code_section.function(&func);
     }
-
-    // ─── Function body compilation ───────────────────────────────────────
 
     fn compile_func_body(
         &mut self,
@@ -222,10 +263,10 @@ impl Compiler {
 
         let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
 
-        let mut ctx = FunctionContext::new(&param_names, &meta.param_types);
+        self.current_context = Some(FunctionContext::new(&param_names, &meta.param_types, self.string_type_index, self.i64_array_type_index));
 
         for stmt in body {
-            self.compile_stmt(&stmt.node, &mut ctx);
+            self.compile_stmt(&stmt.node);
         }
 
         // If the function returns void (None), ensure we don't leave anything dangling
@@ -233,20 +274,18 @@ impl Compiler {
             // An implicit return at the end (no value)
         }
 
-        ctx.emit_end();
-        let func = ctx.build();
+        self.ctx().emit_end();
+        let func = self.ctx().build();
         self.code_section.function(&func);
     }
 
-    // ─── Statement compilation ───────────────────────────────────────────
-
-    fn compile_stmt(&self, stmt: &Stmt, ctx: &mut FunctionContext) {
+    fn compile_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(expr) => {
-                let ty = self.compile_expr(&expr.node, ctx);
+                let ty = self.compile_expr(&expr.node);
                 // Drop the value from the stack if it's not void
                 if ty != WasmType::Void {
-                    ctx.emit(&Instruction::Drop);
+                    self.ctx().emit(&Instruction::Drop);
                 }
             }
 
@@ -255,22 +294,22 @@ impl Compiler {
                 value,
                 type_hint,
             } => {
-                self.compile_assign(targets, value, type_hint, ctx);
+                self.compile_assign(targets, value, type_hint);
             }
 
             Stmt::AugAssign {
                 target, op, value, ..
             } => {
-                self.compile_aug_assign(target, op, value, ctx);
+                self.compile_aug_assign(target, op, value);
             }
 
             Stmt::Return(Some(expr)) => {
-                self.compile_expr(&expr.node, ctx);
-                ctx.emit(&Instruction::Return);
+                self.compile_expr(&expr.node);
+                self.ctx().emit(&Instruction::Return);
             }
 
             Stmt::Return(None) => {
-                ctx.emit(&Instruction::Return);
+                self.ctx().emit(&Instruction::Return);
             }
 
             Stmt::If {
@@ -279,7 +318,7 @@ impl Compiler {
                 elif_clauses,
                 else_body,
             } => {
-                self.compile_if(test, body, elif_clauses, else_body, ctx);
+                self.compile_if(test, body, elif_clauses, else_body);
             }
 
             Stmt::While {
@@ -287,19 +326,19 @@ impl Compiler {
                 body,
                 else_body,
             } => {
-                self.compile_while(test, body, else_body, ctx);
+                self.compile_while(test, body, else_body);
             }
 
             Stmt::Pass => {}
 
             Stmt::Break => {
                 // In our while compilation pattern, the outer block is at depth 1
-                ctx.emit(&Instruction::Br(1));
+                self.ctx().emit(&Instruction::Br(1));
             }
 
             Stmt::Continue => {
                 // In our while compilation pattern, the loop is at depth 0
-                ctx.emit(&Instruction::Br(0));
+                self.ctx().emit(&Instruction::Br(0));
             }
 
             Stmt::FuncDef { .. } => {
@@ -316,14 +355,8 @@ impl Compiler {
         }
     }
 
-    fn compile_assign(
-        &self,
-        targets: &[Spanned<Expr>],
-        value: &Spanned<Expr>,
-        type_hint: &Option<Spanned<TypeHint>>,
-        ctx: &mut FunctionContext,
-    ) {
-        let val_type = self.compile_expr(&value.node, ctx);
+    fn compile_assign(&mut self, targets: &[Spanned<Expr>], value: &Spanned<Expr>, type_hint: &Option<Spanned<TypeHint>>) {
+        let val_type = self.compile_expr(&value.node);
 
         for target in targets {
             if let Expr::Name(name) = &target.node {
@@ -333,86 +366,55 @@ impl Compiler {
                     val_type
                 };
 
-                let idx = ctx.declare_local(name.clone(), wasm_type);
+                let idx = self.ctx().declare_local(name.clone(), wasm_type);
 
                 // If the value type doesn't match the declared type, emit a promotion
-                self.emit_promotion(ctx, val_type, wasm_type);
+                self.emit_promotion(val_type, wasm_type);
 
-                ctx.emit(&Instruction::LocalSet(idx));
+                self.ctx().emit(&Instruction::LocalSet(idx));
             }
         }
     }
 
-    fn compile_aug_assign(
-        &self,
-        target: &Spanned<Expr>,
-        op: &AugOp,
-        value: &Spanned<Expr>,
-        ctx: &mut FunctionContext,
-    ) {
+    fn compile_aug_assign(&mut self, target: &Spanned<Expr>, op: &AugOp, value: &Spanned<Expr>) {
         if let Expr::Name(name) = &target.node {
-            let idx = ctx.get_local(name).unwrap();
-            let var_type = ctx.get_local_type(name).unwrap();
+            let idx = self.ctx().get_local(name).unwrap();
+            let var_type = self.ctx().get_local_type(name).unwrap();
 
             // Load current value
-            ctx.emit(&Instruction::LocalGet(idx));
+            self.ctx().emit(&Instruction::LocalGet(idx));
 
             // Compile the RHS value
-            let val_type = self.compile_expr(&value.node, ctx);
+            let val_type = self.compile_expr(&value.node);
 
             // Promote RHS if needed
-            self.emit_promotion(ctx, val_type, var_type);
+            self.emit_promotion(val_type, var_type);
 
             // Emit the operation
-            match var_type {
-                WasmType::I64 => match op {
-                    AugOp::Add => ctx.emit(&Instruction::I64Add),
-                    AugOp::Sub => ctx.emit(&Instruction::I64Sub),
-                    AugOp::Mul => ctx.emit(&Instruction::I64Mul),
-                    AugOp::Div => ctx.emit(&Instruction::I64DivS),
-                    AugOp::FloorDiv => ctx.emit(&Instruction::I64DivS),
-                    AugOp::Mod => ctx.emit(&Instruction::I64RemS),
-                    AugOp::BitAnd => ctx.emit(&Instruction::I64And),
-                    AugOp::BitOr => ctx.emit(&Instruction::I64Or),
-                    AugOp::BitXor => ctx.emit(&Instruction::I64Xor),
-                    AugOp::LShift => ctx.emit(&Instruction::I64Shl),
-                    AugOp::RShift => ctx.emit(&Instruction::I64ShrS),
-                    _ => {}
-                },
-                WasmType::F64 => match op {
-                    AugOp::Add => ctx.emit(&Instruction::F64Add),
-                    AugOp::Sub => ctx.emit(&Instruction::F64Sub),
-                    AugOp::Mul => ctx.emit(&Instruction::F64Mul),
-                    AugOp::Div => ctx.emit(&Instruction::F64Div),
-                    _ => {}
-                },
-                _ => {}
-            }
+            self.emit_aug_assign_dispatch(val_type, op);
 
-            ctx.emit(&Instruction::LocalSet(idx));
+            self.ctx().emit(&Instruction::LocalSet(idx));
         }
     }
-
-    // ─── Expression compilation ──────────────────────────────────────────
 
     /// Compile an expression, leaving its result on the WASM operand stack.
     /// Returns the WasmType of the result.
-    fn compile_expr(&self, expr: &Expr, ctx: &mut FunctionContext) -> WasmType {
+    fn compile_expr(&mut self, expr: &Expr) -> WasmType {
         match expr {
             Expr::Number(text) => {
-                if text.contains('.') || text.contains('e') || text.contains('E') {
+                if Self::is_floating_point(text) {
                     let val: f64 = text.parse().unwrap_or(0.0);
-                    ctx.emit(&Instruction::F64Const(val.into()));
+                    self.ctx().emit(&Instruction::F64Const(val.into()));
                     WasmType::F64
                 } else {
                     let val: i64 = text.parse().unwrap_or(0);
-                    ctx.emit(&Instruction::I64Const(val));
+                    self.ctx().emit(&Instruction::I64Const(val));
                     WasmType::I64
                 }
             }
 
             Expr::Bool(b) => {
-                ctx.emit(&Instruction::I32Const(if *b { 1 } else { 0 }));
+                self.ctx().emit(&Instruction::I32Const(if *b { 1 } else { 0 }));
                 WasmType::I32
             }
 
@@ -422,217 +424,82 @@ impl Compiler {
             }
 
             Expr::Name(name) => {
-                let idx = ctx.get_local(name).unwrap();
-                let ty = ctx.get_local_type(name).unwrap();
-                ctx.emit(&Instruction::LocalGet(idx));
+                let idx = self.ctx().get_local(name).unwrap();
+                let ty = self.ctx().get_local_type(name).unwrap();
+                self.ctx().emit(&Instruction::LocalGet(idx));
                 ty
             }
 
             Expr::BinOp { left, op, right } => {
-                self.compile_bin_op(ctx, op, left, right)
+                self.compile_bin_op(op, left, right)
             }
 
             Expr::UnaryOp { op, operand } => {
-                self.compile_unary_op(ctx, op, operand)
+                self.compile_unary_op(op, operand)
             }
 
             Expr::Compare {
                 left,
                 ops,
                 comparators,
-            } => self.compile_compare(left, ops, comparators, ctx),
+            } => self.compile_compare(left, ops, comparators),
 
             Expr::IfExpr { test, body, orelse } => {
-                self.compile_if_expr(test, body, orelse, ctx)
+                self.compile_if_expr(test, body, orelse)
             }
 
             Expr::Call { func, args, .. } => {
-                self.compile_call(func, args, ctx)
+                self.compile_call(func, args)
+            }
+
+            Expr::List(args) => {
+                self.compile_list_literal(args)
+            }
+
+            Expr::StringLit(s) => {
+                self.compile_string_literal(s)
             }
 
             _ => WasmType::Void,
         }
     }
 
-    fn compile_if_expr(
-        &self,
-        test: &Spanned<Expr>,
-        body: &Spanned<Expr>,
-        orelse: &Spanned<Expr>,
-        ctx: &mut FunctionContext,
-    ) -> WasmType {
-        self.compile_expr(&test.node, ctx);
+    fn compile_if_expr(&mut self, test: &Spanned<Expr>, body: &Spanned<Expr>, orelse: &Spanned<Expr>) -> WasmType {
+        self.compile_expr(&test.node);
 
         // We need to know the result type to emit the correct BlockType.
         // Since the type checker has validated both branches have the same type,
         // we can peek at the body type. We'll use a simple heuristic based on the expression.
-        let result_val_type = self.peek_expr_type(&body.node, ctx);
-        let block_type = match result_val_type.to_val_type() {
+        let result_val_type = self.peek_expr_type(&body.node);
+        let block_type = match result_val_type.to_val_type(self.string_type_index, self.i64_array_type_index) {
             Some(vt) => BlockType::Result(vt),
             None => BlockType::Empty,
         };
 
-        ctx.emit(&Instruction::If(block_type));
-        self.compile_expr(&body.node, ctx);
-        ctx.emit(&Instruction::Else);
-        self.compile_expr(&orelse.node, ctx);
-        ctx.emit(&Instruction::End);
+        self.ctx().emit(&Instruction::If(block_type));
+        self.compile_expr(&body.node);
+        self.ctx().emit(&Instruction::Else);
+        self.compile_expr(&orelse.node);
+        self.ctx().emit(&Instruction::End);
 
         result_val_type
     }
 
-    fn compile_call(
-        &self,
-        func: &Spanned<Expr>,
-        args: &[Spanned<Expr>],
-        ctx: &mut FunctionContext,
-    ) -> WasmType {
+    fn compile_call(&mut self, func: &Spanned<Expr>, args: &[Spanned<Expr>]) -> WasmType {
         if let Expr::Name(name) = &func.node {
             let meta = self.func_table.get(name).cloned().unwrap();
 
             // Compile arguments, promoting types as needed
             for (i, arg) in args.iter().enumerate() {
-                let arg_type = self.compile_expr(&arg.node, ctx);
+                let arg_type = self.compile_expr(&arg.node);
                 let expected = meta.param_types[i];
-                self.emit_promotion(ctx, arg_type, expected);
+                self.emit_promotion(arg_type, expected);
             }
 
-            ctx.emit(&Instruction::Call(meta.func_index));
+            self.ctx().emit(&Instruction::Call(meta.func_index));
             meta.return_type
         } else {
             WasmType::Void
-        }
-    }
-
-    // ─── Control flow ────────────────────────────────────────────────────
-
-    fn compile_if(
-        &self,
-        test: &Spanned<Expr>,
-        body: &[Spanned<Stmt>],
-        elif_clauses: &[(Spanned<Expr>, Vec<Spanned<Stmt>>)],
-        else_body: &Option<Vec<Spanned<Stmt>>>,
-        ctx: &mut FunctionContext,
-    ) {
-        self.compile_expr(&test.node, ctx);
-        ctx.emit(&Instruction::If(BlockType::Empty));
-
-        for stmt in body {
-            self.compile_stmt(&stmt.node, ctx);
-        }
-
-        if !elif_clauses.is_empty() || else_body.is_some() {
-            ctx.emit(&Instruction::Else);
-
-            // Elif chains become nested if/else
-            let mut remaining_elifs = elif_clauses.iter().peekable();
-            if let Some((elif_test, elif_body)) = remaining_elifs.next() {
-                self.compile_if(
-                    elif_test,
-                    elif_body,
-                    &elif_clauses[1..].to_vec(),
-                    else_body,
-                    ctx,
-                );
-            } else if let Some(else_stmts) = else_body {
-                for stmt in else_stmts {
-                    self.compile_stmt(&stmt.node, ctx);
-                }
-            }
-        }
-
-        ctx.emit(&Instruction::End);
-    }
-
-    fn compile_while(
-        &self,
-        test: &Spanned<Expr>,
-        body: &[Spanned<Stmt>],
-        _else_body: &Option<Vec<Spanned<Stmt>>>,
-        ctx: &mut FunctionContext,
-    ) {
-        // WASM pattern for while loops:
-        // block $exit
-        //   loop $loop
-        //     <test>
-        //     i32.eqz
-        //     br_if $exit    ;; if test is false, break out
-        //     <body>
-        //     br $loop       ;; continue loop
-        //   end
-        // end
-        ctx.emit(&Instruction::Block(BlockType::Empty));
-        ctx.emit(&Instruction::Loop(BlockType::Empty));
-
-        // Compile test
-        self.compile_expr(&test.node, ctx);
-        ctx.emit(&Instruction::I32Eqz);
-        ctx.emit(&Instruction::BrIf(1)); // break to outer block if test is false
-
-        // Compile body
-        for stmt in body {
-            self.compile_stmt(&stmt.node, ctx);
-        }
-
-        ctx.emit(&Instruction::Br(0)); // jump back to loop start
-        ctx.emit(&Instruction::End); // end loop
-        ctx.emit(&Instruction::End); // end block
-    }
-
-    // ─── Helpers ─────────────────────────────────────────────────────────
-
-    /// Emit promotion instructions to convert `actual` type to `expected` type.
-    /// The value to promote is assumed to be on top of the WASM stack.
-    fn emit_promotion(&self, ctx: &mut FunctionContext, actual: WasmType, expected: WasmType) {
-        if actual == expected {
-            return;
-        }
-        match (actual, expected) {
-            (WasmType::I32, WasmType::I64) => {
-                ctx.emit(&Instruction::I64ExtendI32S);
-            }
-            (WasmType::I32, WasmType::F64) => {
-                ctx.emit(&Instruction::F64ConvertI32S);
-            }
-            (WasmType::I64, WasmType::F64) => {
-                ctx.emit(&Instruction::F64ConvertI64S);
-            }
-            _ => {
-                // No conversion needed or unsupported
-            }
-        }
-    }
-
-    /// Peek at what type an expression would produce (without emitting code).
-    /// Used for BlockType decisions in if-expressions.
-    fn peek_expr_type(&self, expr: &Expr, ctx: &FunctionContext) -> WasmType {
-        match expr {
-            Expr::Number(text) => {
-                if text.contains('.') || text.contains('e') || text.contains('E') {
-                    WasmType::F64
-                } else {
-                    WasmType::I64
-                }
-            }
-            Expr::Bool(_) => WasmType::I32,
-            Expr::NoneLit => WasmType::Void,
-            Expr::Name(name) => ctx.get_local_type(name).unwrap_or(WasmType::Void),
-            Expr::BinOp { .. } => {
-                // Approximate: could be more precise
-                WasmType::I64
-            }
-            Expr::Compare { .. } => WasmType::I32,
-            Expr::Call { func, .. } => {
-                if let Expr::Name(name) = &func.node {
-                    self.func_table
-                        .get(name)
-                        .map(|m| m.return_type)
-                        .unwrap_or(WasmType::Void)
-                } else {
-                    WasmType::Void
-                }
-            }
-            _ => WasmType::Void,
         }
     }
 }

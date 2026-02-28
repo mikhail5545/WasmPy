@@ -37,12 +37,14 @@ pub struct FunctionContext {
     next_local_idx: u32,
     /// Buffered raw instruction bytes
     instruction_bytes: Vec<u8>,
+    string_type_index: u32,
+    i64_array_type_index: u32,
 }
 
 impl FunctionContext {
     /// Create a new function context. `param_names` and `param_types` are parallel arrays.
     /// Parameters are automatically registered as locals at indices 0..N.
-    pub fn new(param_names: &[String], param_wasm_types: &[WasmType]) -> Self {
+    pub fn new(param_names: &[String], param_wasm_types: &[WasmType], str_type_idx: u32, i64_arr_idx: u32) -> Self {
         let mut locals = HashMap::new();
         let mut local_types = HashMap::new();
 
@@ -60,11 +62,13 @@ impl FunctionContext {
             param_count,
             next_local_idx: param_count,
             instruction_bytes: Vec::new(),
+            string_type_index: str_type_idx,
+            i64_array_type_index: i64_arr_idx,
         }
     }
 
     /// Create a minimal function context for module-level code (no params).
-    pub fn new_start() -> Self {
+    pub fn new_start(str_type_idx: u32, i64_arr_idx: u32) -> Self {
         Self {
             locals: HashMap::new(),
             local_types: HashMap::new(),
@@ -72,6 +76,8 @@ impl FunctionContext {
             param_count: 0,
             next_local_idx: 0,
             instruction_bytes: Vec::new(),
+            string_type_index: str_type_idx,
+            i64_array_type_index: i64_arr_idx,
         }
     }
 
@@ -82,7 +88,7 @@ impl FunctionContext {
             return existing_idx;
         }
         let val_type = wasm_type
-            .to_val_type()
+            .to_val_type(self.string_type_index, self.i64_array_type_index)
             .expect("Cannot declare a local with Void type");
         let idx = self.next_local_idx;
         self.extra_local_types.push(val_type);
@@ -113,7 +119,7 @@ impl FunctionContext {
     }
 
     /// Build the final `wasm_encoder::Function` from the collected locals and instructions.
-    pub fn build(self) -> Function {
+    pub fn build(&self) -> Function {
         // Group consecutive locals of the same type for compact encoding
         let mut grouped: Vec<(u32, ValType)> = Vec::new();
         for vt in &self.extra_local_types {
@@ -127,7 +133,7 @@ impl FunctionContext {
         }
 
         let mut func = Function::new(grouped);
-        func.raw(self.instruction_bytes);
+        func.raw(self.instruction_bytes.clone());
         func
     }
 }

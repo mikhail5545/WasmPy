@@ -15,7 +15,7 @@
  */
 
 use ast::types::TypeHint;
-use wasm_encoder::ValType;
+use wasm_encoder::{HeapType, RefType, ValType};
 use std::fmt;
 
 /// Represents a WASM-level type that a Python value maps to.
@@ -27,6 +27,10 @@ pub enum WasmType {
     F64,
     /// Python `bool` → WASM `i32` (0 or 1)
     I32,
+    /// Python `str` → WASM reference type (`ref null $string_type_index`)
+    StringRef,
+    /// Python `list` → WASM reference type (ref null `$i64_list_type_index`)
+    ListRef,
     /// Python `None` / void return → no WASM value
     Void,
 }
@@ -52,11 +56,19 @@ impl WasmType {
     }
 
     /// Convert to `wasm_encoder::ValType`. Returns `None` for `Void`.
-    pub fn to_val_type(self) -> Option<ValType> {
+    pub fn to_val_type(&self, string_index: u32, list_index: u32) -> Option<ValType> {
         match self {
             WasmType::I64 => Some(ValType::I64),
             WasmType::F64 => Some(ValType::F64),
             WasmType::I32 => Some(ValType::I32),
+            WasmType::StringRef => Some(ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(string_index),
+            })),
+            WasmType::ListRef => Some(ValType::Ref(RefType{
+                nullable: true,
+                heap_type: HeapType::Concrete(list_index),
+            })),
             WasmType::Void => None,
         }
     }
@@ -99,6 +111,8 @@ impl fmt::Display for WasmType {
             WasmType::I64 => write!(f, "int"),
             WasmType::F64 => write!(f, "float"),
             WasmType::I32 => write!(f, "bool"),
+            WasmType::StringRef => write!(f, "string"),
+            WasmType::ListRef => write!(f, "list"),
             WasmType::Void => write!(f, "None"),
         }
     }
